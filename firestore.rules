@@ -1,0 +1,357 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Common functions for validation and auth checks
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    function isRestaurantOwner(restaurantId) {
+      // Check if the user exists, has the right restaurantId, and is the restaurant owner
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.restaurantId == restaurantId &&
+             exists(/databases/$(database)/documents/restaurants/$(restaurantId)) &&
+             get(/databases/$(database)/documents/restaurants/$(restaurantId)).data.ownerId == request.auth.uid;
+    }
+    
+    function isRestaurantAdmin(restaurantId) {
+      // Check if the user exists, has the right restaurantId, and has admin role
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.restaurantId == restaurantId &&
+             (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.admin == true ||
+              isRestaurantOwner(restaurantId));
+    }
+    
+    function isRestaurantStaff(restaurantId) {
+      // Check if user exists and has associated restaurant ID
+      let userData = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      
+      // Check if user's restaurantId matches the requested restaurant
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             (
+               // Direct restaurant ownership
+               userData.restaurantId == restaurantId ||
+               isRestaurantOwner(restaurantId) ||
+               isRestaurantAdmin(restaurantId) ||
+               // OR check if user has a role for this specific restaurant
+               (
+                 'roles' in userData &&
+                 (
+                   (userData.roles[restaurantId] != null && 
+                    (userData.roles[restaurantId].admin == true || 
+                     userData.roles[restaurantId].staff == true))
+                 )
+               )
+             );
+    }
+    
+    function getUserRestaurants() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.restaurants;
+    }
+    
+    // Validation functions
+    function validateStaffRole(data) {
+      return data.keys().hasAll(['name', 'permissions', 'restaurantId']) &&
+             data.name is string &&
+             data.permissions is list &&
+             data.restaurantId is string;
+    }
+    
+    function validateShiftData(data) {
+      return data.keys().hasAll(['staffId', 'staffName', 'startTime', 'endTime', 'date', 'status', 'restaurantId']) &&
+             data.staffId is string &&
+             data.staffName is string &&
+             data.startTime is string &&
+             data.endTime is string &&
+             data.date is timestamp &&
+             data.status in ['scheduled', 'active', 'completed', 'cancelled'] &&
+             data.restaurantId is string;
+    }
+    
+    function validateActivityLog(data) {
+      return data.keys().hasAll(['staffId', 'staffName', 'action', 'details', 'restaurantId']) &&
+             data.staffId is string &&
+             data.staffName is string &&
+             data.action is string &&
+             data.details is string &&
+             data.restaurantId is string;
+    }
+
+    // User profiles - users can read/write only their own data
+    match /users/{userId} {
+      allow read: if isSignedIn() && isOwner(userId);
+      allow write: if isSignedIn() && isOwner(userId);
+      
+      // User's role assignments
+      match /roles/{roleId} {
+        allow read: if isSignedIn() && isOwner(userId);
+        allow write: if isSignedIn() && isOwner(userId);
+      }
+      
+      // Allow onboarding status access - important for tracking progress
+      match /onboarding/{docId} {
+        allow read, write: if isSignedIn() && isOwner(userId);
+      }
+    }
+    
+    // Restaurants collection
+    match /restaurants/{restaurantId} {
+      // Allow public read access for checking subdomain availability during registration
+      allow get: if true;
+      
+      // Allow restaurant read (listing) if user is staff 
+      allow list: if isSignedIn() && (isRestaurantStaff(restaurantId) || 
+                                      request.auth.uid in getUserRestaurants());
+      
+      // More permissive update rules - allow restaurant creator to update during onboarding
+      // This specifically fixes the permissions error during onboarding
+      allow update: if isSignedIn() && 
+                     (isRestaurantOwner(restaurantId) || 
+                      request.auth.uid == resource.data.ownerId);
+      
+      allow delete: if isSignedIn() && isRestaurantOwner(restaurantId);
+      
+      // Allow creation if authenticated (for onboarding)
+      allow create: if isSignedIn();
+      
+      // Restaurant roles collection
+      match /roles/{userId} {
+        allow read: if isSignedIn() && (isRestaurantAdmin(restaurantId) || isOwner(userId));
+        allow write: if isSignedIn() && (isRestaurantAdmin(restaurantId) || isOwner(userId));
+      }
+      
+      // Onboarding data collection - for storing steps progress
+      match /onboarding/{docId} {
+        allow read, write: if isSignedIn() && 
+                            (isRestaurantStaff(restaurantId) || 
+                             resource.data.ownerId == request.auth.uid || 
+                             request.resource.data.ownerId == request.auth.uid);
+      }
+      
+      // Menu collection
+      match /menu/{menuId} {
+        // Staff can read menu
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        
+        // Only admin or owner can modify menu
+        allow write: if isSignedIn() && isRestaurantAdmin(restaurantId);
+        
+        // Menu items
+        match /items/{itemId} {
+          allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+          allow write: if isSignedIn() && isRestaurantAdmin(restaurantId);
+        }
+      }
+      
+      // Orders collection
+      match /orders/{orderId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow update, delete: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Orders list operation
+      match /orders {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Reservations collection
+      match /reservations/{reservationId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create: if isSignedIn();
+        allow update, delete: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Inventory - Ingredients subcollection
+      match /ingredients/{ingredientId} {
+        // Only restaurant staff can read ingredients
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Only admin can modify ingredients
+        allow create, update, delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      // Important: For subcollections list operation
+      match /ingredients {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Stock Transactions subcollection - SECURE RULES
+      match /stockTransactions/{transactionId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Only admin or staff can create transactions
+        allow create: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Once created, transactions cannot be modified or deleted
+        allow update, delete: if false;
+      }
+      
+      // Stock Transactions list operation - SECURE RULES
+      match /stockTransactions {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Waste Log subcollection - SECURE RULES
+      match /wasteLog/{entryId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Only admin or staff can create waste log entries
+        allow create: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Once created, waste log entries cannot be modified or deleted
+        allow update, delete: if false;
+      }
+      
+      // Waste Log list operation - SECURE RULES
+      match /wasteLog {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+
+      // Purchase Orders collection - SECURE RULES
+      match /purchaseOrders/{orderId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Staff can create and update purchase orders
+        allow create, update: if isSignedIn() && isRestaurantStaff(restaurantId);
+        // Only admin can delete purchase orders
+        allow delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      // Purchase Orders list operation - SECURE RULES
+      match /purchaseOrders {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Tables collection - for table management
+      match /tables/{tableId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create, update, delete: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Tables list operation
+      match /tables {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Zones collection - for restaurant zones/areas
+      match /zones/{zoneId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create, update, delete: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Zones list operation
+      match /zones {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Waiters collection - for waiter management
+      match /waiters/{waiterId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create, update, delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      // Waiters list operation
+      match /waiters {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Staff collection - for staff management
+      match /staff/{staffId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create, update, delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      // Staff list operation
+      match /staff {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Staff roles and permissions
+      match /staffRoles/{roleId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create: if isSignedIn() && isRestaurantAdmin(restaurantId) &&
+                     validateStaffRole(request.resource.data);
+        allow update: if isSignedIn() && isRestaurantAdmin(restaurantId) &&
+                     validateStaffRole(request.resource.data) &&
+                     resource.data.restaurantId == restaurantId;
+        allow delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      match /staffRoles {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Staff shifts and scheduling
+      match /shifts/{shiftId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create: if isSignedIn() && isRestaurantAdmin(restaurantId) &&
+                     validateShiftData(request.resource.data);
+        allow update: if isSignedIn() && isRestaurantAdmin(restaurantId) &&
+                     validateShiftData(request.resource.data) &&
+                     resource.data.restaurantId == restaurantId;
+        allow delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      match /shifts {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Staff activity logs
+      match /activityLogs/{logId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create: if isSignedIn() && isRestaurantStaff(restaurantId) &&
+                     validateActivityLog(request.resource.data);
+        // Activity logs should not be deleted or modified for audit purposes
+        allow update, delete: if false;
+      }
+      
+      match /activityLogs {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+      
+      // Staff performance data
+      match /staffPerformance/{performanceId} {
+        allow read: if isSignedIn() && isRestaurantStaff(restaurantId);
+        allow create, update: if isSignedIn() && isRestaurantAdmin(restaurantId);
+        allow delete: if isSignedIn() && isRestaurantAdmin(restaurantId);
+      }
+      
+      match /staffPerformance {
+        allow list: if isSignedIn() && isRestaurantStaff(restaurantId);
+      }
+    }
+    
+    // Root-level staff collection (for staff management)
+    match /staff/{staffId} {
+      // Allow reading staff if user is signed in and belongs to the same restaurant
+      allow read: if isSignedIn() && 
+                  exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                  get(/databases/$(database)/documents/users/$(request.auth.uid)).data.restaurantId == resource.data.restaurantId;
+      
+      // Allow creating/updating staff if user is admin of the restaurant
+      allow create, update: if isSignedIn() && 
+                           exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.restaurantId == request.resource.data.restaurantId &&
+                           (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.admin == true ||
+                            isRestaurantOwner(request.resource.data.restaurantId));
+      
+      // Allow deleting staff if user is admin of the restaurant  
+      allow delete: if isSignedIn() && 
+                   exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                   get(/databases/$(database)/documents/users/$(request.auth.uid)).data.restaurantId == resource.data.restaurantId &&
+                   (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roles.admin == true ||
+                    isRestaurantOwner(resource.data.restaurantId));
+    }
+    
+    // Root-level staffRoles collection (for roles and permissions management)
+    match /staffRoles/{roleId} {
+      // Temporarily allow all operations for authenticated users while debugging
+      allow read, write: if isSignedIn();
+    }
+    
+    // Public access for connection testing (only during development)
+    match /connection-test/{docId} {
+      allow read, write: if true;
+    }
+  }
+}
